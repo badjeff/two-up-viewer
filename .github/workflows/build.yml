@@ -1,0 +1,108 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Compile
+        run: swift build -Xswiftc -warnings-as-errors
+
+  app:
+    name: Universal app
+    needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Bundle
+        run: ./build-app.sh
+
+      - name: Assert both slices
+        env:
+          BIN: build/two-up-viewer.app/Contents/MacOS/two-up-viewer
+        run: |
+          set -euo pipefail
+          archs="$(lipo -archs "$BIN")"
+          echo "archs: $archs"
+          for arch in x86_64 arm64; do
+            case "$archs" in
+              *"$arch"*) ;;
+              *)
+                echo "::error::no $arch slice in the bundle, so it will not run on that Mac"
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Assert deployment target
+        env:
+          BIN: build/two-up-viewer.app/Contents/MacOS/two-up-viewer
+        run: |
+          set -euo pipefail
+          declared="$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' \
+            build/two-up-viewer.app/Contents/Info.plist)"
+          for arch in x86_64 arm64; do
+            minos="$(vtool -show-build -arch "$arch" "$BIN" | awk '/minos/ { print $2 }')"
+            echo "$arch minos $minos, bundle declares $declared"
+            if [ "$minos" != "$declared" ]; then
+              echo "::error::$arch targets macOS $minos but the bundle declares $declared"
+              exit 1
+            fi
+          done
+
+      - name: Assert OS-only linkage
+        env:
+          BIN: build/two-up-viewer.app/Contents/MacOS/two-up-viewer
+        run: |
+          set -euo pipefail
+          outside="$(otool -L "$BIN" | awk '/^[[:space:]]/ { print $1 }' \
+            | grep -Ev '^(/usr/lib/|/System/)' || true)"
+          if [ -n "$outside" ]; then
+            echo "::error::dependencies outside the OS, so this needs a toolchain on the target Mac:"
+            echo "$outside"
+            exit 1
+          fi
+          echo "every dependency is /usr/lib or /System"
+
+      - name: Assert signature
+        run: codesign --verify --deep --strict --verbose=2 build/two-up-viewer.app
+
+      - name: Archive
+        run: ditto -c -k --sequesterRsrc --keepParent build/two-up-viewer.app build/two-up-viewer.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: two-up-viewer-${{ github.sha }}
+          path: build/two-up-viewer.zip
+          if-no-files-found: error
